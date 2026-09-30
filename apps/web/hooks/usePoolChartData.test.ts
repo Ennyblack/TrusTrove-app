@@ -17,7 +17,7 @@ describe("usePoolChartData", () => {
         width: 500,
         height: 200,
         padding: 20,
-      })
+      }),
     );
 
     expect(result.current.points).toHaveLength(1);
@@ -37,7 +37,7 @@ describe("usePoolChartData", () => {
         width: 100,
         height: 100,
         padding: 10,
-      })
+      }),
     );
 
     expect(result.current.points).toHaveLength(2);

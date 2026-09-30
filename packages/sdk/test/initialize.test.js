@@ -11,7 +11,7 @@ const adminAddress = Keypair.random().publicKey();
 function createClient(ClientClass) {
   return new (class extends ClientClass {
     constructor() {
-      super("test-contract");
+      super("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     }
 
     async writeContract(method, args, publicKey) {
