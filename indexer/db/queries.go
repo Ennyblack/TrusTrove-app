@@ -12,21 +12,25 @@ import (
 )
 
 type DbInvoice struct {
-	ID               string `json:"id"`
-	Issuer           string `json:"issuer"`
-	Buyer            string `json:"buyer"`
-	FaceValue        string `json:"face_value"` // BigInt represented as string for JSON/SQL numeric safety
-	DiscountBps      int    `json:"discount_bps"`
-	FundedAmount     string `json:"funded_amount"`
-	DueDate          int64  `json:"due_date"`
-	Status           string `json:"status"`
-	CreatedAt        int64  `json:"created_at"`
-	FundedAt         *int64 `json:"funded_at"`
-	ShippedAt        *int64 `json:"shipped_at"`
-	IssuerConfirmed  bool   `json:"issuer_confirmed"`
-	BuyerConfirmed   bool   `json:"buyer_confirmed"`
-	BuyerConfirmedAt *int64 `json:"buyer_confirmed_at"`
-	RepaidAt         *int64 `json:"repaid_at"`
+	ID                 string  `json:"id"`
+	Issuer             string  `json:"issuer"`
+	Buyer              string  `json:"buyer"`
+	FaceValue          string  `json:"face_value"` // BigInt represented as string for JSON/SQL numeric safety
+	DiscountBps        int     `json:"discount_bps"`
+	FundedAmount       string  `json:"funded_amount"`
+	DueDate            int64   `json:"due_date"`
+	Status             string  `json:"status"`
+	CreatedAt          int64   `json:"created_at"`
+	FundedAt           *int64  `json:"funded_at"`
+	ShippedAt          *int64  `json:"shipped_at"`
+	IssuerConfirmed    bool    `json:"issuer_confirmed"`
+	BuyerConfirmed     bool    `json:"buyer_confirmed"`
+	BuyerConfirmedAt   *int64  `json:"buyer_confirmed_at"`
+	RepaidAt           *int64  `json:"repaid_at"`
+	AttestationAgentID *string `json:"attestation_agent_id"`
+	RiskScoreBps       *int    `json:"risk_score_bps"`
+	EvidenceHash       *string `json:"evidence_hash"`
+	AttestedAt         *int64  `json:"attested_at"`
 }
 
 type DbPoolStats struct {
@@ -51,21 +55,33 @@ type ProtocolStats struct {
 	RegisteredIssuers  int    `json:"registered_issuers"`
 }
 
+// GetProtocolStats returns the protocol-level aggregates served by GET /stats.
+//
+// Status literals must match the CapCase values the listener writes
+// (Created, Listed, Funded, Active, Confirmed, Repaid, Defaulted); Postgres
+// string comparison is case-sensitive. An invoice counts as "active" while
+// capital is deployed and not yet returned: Funded, Active (shipped) and
+// Confirmed (delivery confirmed, awaiting repayment). The financed total and
+// average yield additionally include Repaid invoices.
 func GetProtocolStats(ctx context.Context) (*ProtocolStats, error) {
+	return getProtocolStats(ctx, Pool)
+}
+
+func getProtocolStats(ctx context.Context, q Querier) (*ProtocolStats, error) {
 	query := `
 		SELECT
-			COALESCE(SUM(funded_amount) FILTER (WHERE status IN ('funded', 'shipped', 'confirmed', 'repaid')), 0)::TEXT AS total_usdc_financed,
-			COUNT(*) FILTER (WHERE status IN ('funded', 'shipped', 'confirmed')) AS active_invoice_count,
+			COALESCE(SUM(funded_amount) FILTER (WHERE status IN ('Funded', 'Active', 'Confirmed', 'Repaid')), 0)::TEXT AS total_usdc_financed,
+			COUNT(*) FILTER (WHERE status IN ('Funded', 'Active', 'Confirmed')) AS active_invoice_count,
 			COUNT(*) AS total_invoices,
-			COUNT(*) FILTER (WHERE status = 'repaid') AS total_repaid,
-			COUNT(*) FILTER (WHERE status = 'defaulted') AS total_defaulted,
-			COALESCE(AVG(discount_bps) FILTER (WHERE status IN ('funded', 'shipped', 'confirmed', 'repaid')), 0)::INTEGER AS average_yield_bps,
+			COUNT(*) FILTER (WHERE status = 'Repaid') AS total_repaid,
+			COUNT(*) FILTER (WHERE status = 'Defaulted') AS total_defaulted,
+			COALESCE(AVG(discount_bps) FILTER (WHERE status IN ('Funded', 'Active', 'Confirmed', 'Repaid')), 0)::INTEGER AS average_yield_bps,
 			COALESCE((SELECT utilization_rate_bps FROM pool_snapshots WHERE id = 1), 0) AS pool_utilization_bps,
 			COUNT(DISTINCT issuer) AS registered_issuers
 		FROM invoices
 	`
 	var stats ProtocolStats
-	err := Pool.QueryRow(ctx, query).Scan(
+	err := q.QueryRow(ctx, query).Scan(
 		&stats.TotalUSDCFinanced,
 		&stats.ActiveInvoiceCount,
 		&stats.TotalInvoices,
@@ -81,51 +97,64 @@ func GetProtocolStats(ctx context.Context) (*ProtocolStats, error) {
 	return &stats, nil
 }
 
-func InsertInvoice(ctx context.Context, inv *DbInvoice) error {
+// The Insert*/Update* invoice writers and LogEvent below take a Querier so
+// callers can run them against the shared pool (db.Pool) for standalone
+// statements, or against a pgx.Tx when several statements must commit or
+// roll back together (see db.WithTx and the listener's event handling).
+
+func InsertInvoice(ctx context.Context, q Querier, inv *DbInvoice) error {
 	query := `
 		INSERT INTO invoices (
 			id, issuer, buyer, face_value, discount_bps, funded_amount, due_date, status, created_at,
-			funded_at, shipped_at, issuer_confirmed, buyer_confirmed, buyer_confirmed_at, repaid_at
+			funded_at, shipped_at, issuer_confirmed, buyer_confirmed, buyer_confirmed_at, repaid_at,
+			attestation_agent_id, risk_score_bps, evidence_hash, attested_at
 		) VALUES (
 			@id, @issuer, @buyer, @face_value, @discount_bps, @funded_amount, @due_date, @status, @created_at,
-			@funded_at, @shipped_at, @issuer_confirmed, @buyer_confirmed, @buyer_confirmed_at, @repaid_at
+			@funded_at, @shipped_at, @issuer_confirmed, @buyer_confirmed, @buyer_confirmed_at, @repaid_at,
+			@attestation_agent_id, @risk_score_bps, @evidence_hash, @attested_at
 		)
 	`
 	args := pgx.NamedArgs{
-		"id":                 inv.ID,
-		"issuer":             inv.Issuer,
-		"buyer":              inv.Buyer,
-		"face_value":         inv.FaceValue,
-		"discount_bps":       inv.DiscountBps,
-		"funded_amount":      inv.FundedAmount,
-		"due_date":           inv.DueDate,
-		"status":             inv.Status,
-		"created_at":         inv.CreatedAt,
-		"funded_at":          inv.FundedAt,
-		"shipped_at":         inv.ShippedAt,
-		"issuer_confirmed":   inv.IssuerConfirmed,
-		"buyer_confirmed":    inv.BuyerConfirmed,
-		"buyer_confirmed_at": inv.BuyerConfirmedAt,
-		"repaid_at":          inv.RepaidAt,
+		"id":                   inv.ID,
+		"issuer":               inv.Issuer,
+		"buyer":                inv.Buyer,
+		"face_value":           inv.FaceValue,
+		"discount_bps":         inv.DiscountBps,
+		"funded_amount":        inv.FundedAmount,
+		"due_date":             inv.DueDate,
+		"status":               inv.Status,
+		"created_at":           inv.CreatedAt,
+		"funded_at":            inv.FundedAt,
+		"shipped_at":           inv.ShippedAt,
+		"issuer_confirmed":     inv.IssuerConfirmed,
+		"buyer_confirmed":      inv.BuyerConfirmed,
+		"buyer_confirmed_at":   inv.BuyerConfirmedAt,
+		"repaid_at":            inv.RepaidAt,
+		"attestation_agent_id": inv.AttestationAgentID,
+		"risk_score_bps":       inv.RiskScoreBps,
+		"evidence_hash":        inv.EvidenceHash,
+		"attested_at":          inv.AttestedAt,
 	}
-	_, err := Pool.Exec(ctx, query, args)
+	_, err := q.Exec(ctx, query, args)
 	if err != nil {
 		return fmt.Errorf("queries: insert invoice: %w", err)
 	}
 	return nil
 }
 
-func GetInvoiceByID(ctx context.Context, id string) (*DbInvoice, error) {
+func GetInvoiceByID(ctx context.Context, q Querier, id string) (*DbInvoice, error) {
 	query := `
 		SELECT id, issuer, buyer, face_value, discount_bps, funded_amount, due_date, status, created_at,
-			funded_at, shipped_at, issuer_confirmed, buyer_confirmed, buyer_confirmed_at, repaid_at
+			funded_at, shipped_at, issuer_confirmed, buyer_confirmed, buyer_confirmed_at, repaid_at,
+			attestation_agent_id, risk_score_bps, evidence_hash, attested_at
 		FROM invoices WHERE id = $1
 	`
 	var inv DbInvoice
-	err := Pool.QueryRow(ctx, query, id).Scan(
+	err := q.QueryRow(ctx, query, id).Scan(
 		&inv.ID, &inv.Issuer, &inv.Buyer, &inv.FaceValue, &inv.DiscountBps, &inv.FundedAmount,
 		&inv.DueDate, &inv.Status, &inv.CreatedAt, &inv.FundedAt, &inv.ShippedAt,
 		&inv.IssuerConfirmed, &inv.BuyerConfirmed, &inv.BuyerConfirmedAt, &inv.RepaidAt,
+		&inv.AttestationAgentID, &inv.RiskScoreBps, &inv.EvidenceHash, &inv.AttestedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -165,7 +194,8 @@ func GetInvoicesPage(ctx context.Context, status, issuer string, limit, offset i
 	query := fmt.Sprintf(`
 		SELECT 
 			id, issuer, buyer, face_value, discount_bps, funded_amount, due_date, status, created_at,
-			funded_at, shipped_at, issuer_confirmed, buyer_confirmed, buyer_confirmed_at, repaid_at
+			funded_at, shipped_at, issuer_confirmed, buyer_confirmed, buyer_confirmed_at, repaid_at,
+			attestation_agent_id, risk_score_bps, evidence_hash, attested_at
 		FROM invoices%s
 		ORDER BY created_at DESC
 		LIMIT $%d OFFSET $%d
@@ -185,6 +215,7 @@ func GetInvoicesPage(ctx context.Context, status, issuer string, limit, offset i
 			&inv.ID, &inv.Issuer, &inv.Buyer, &inv.FaceValue, &inv.DiscountBps, &inv.FundedAmount,
 			&inv.DueDate, &inv.Status, &inv.CreatedAt, &inv.FundedAt, &inv.ShippedAt,
 			&inv.IssuerConfirmed, &inv.BuyerConfirmed, &inv.BuyerConfirmedAt, &inv.RepaidAt,
+			&inv.AttestationAgentID, &inv.RiskScoreBps, &inv.EvidenceHash, &inv.AttestedAt,
 		); err != nil {
 			return nil, 0, fmt.Errorf("queries: scan invoice: %w", err)
 		}
@@ -193,80 +224,93 @@ func GetInvoicesPage(ctx context.Context, status, issuer string, limit, offset i
 	return invoices, total, nil
 }
 
-func UpdateInvoiceListed(ctx context.Context, id string, status string, discountBps int) error {
+func UpdateInvoiceListed(ctx context.Context, q Querier, id string, status string, discountBps int) error {
 	query := `
 		UPDATE invoices 
 		SET status = $1, discount_bps = $2
 		WHERE id = $3
 	`
-	_, err := Pool.Exec(ctx, query, status, discountBps, id)
+	_, err := q.Exec(ctx, query, status, discountBps, id)
 	if err != nil {
 		return fmt.Errorf("queries: update invoice listed: %w", err)
 	}
 	return nil
 }
 
-func UpdateInvoiceFunded(ctx context.Context, id string, status string, fundedAmount string, fundedAt int64) error {
+func UpdateInvoiceFunded(ctx context.Context, q Querier, id string, status string, fundedAmount string, fundedAt int64) error {
 	query := `
 		UPDATE invoices 
 		SET status = $1, funded_amount = $2, funded_at = $3
 		WHERE id = $4
 	`
-	_, err := Pool.Exec(ctx, query, status, fundedAmount, fundedAt, id)
+	_, err := q.Exec(ctx, query, status, fundedAmount, fundedAt, id)
 	if err != nil {
 		return fmt.Errorf("queries: update invoice funded: %w", err)
 	}
 	return nil
 }
 
-func UpdateInvoiceShipped(ctx context.Context, id string, status string, shippedAt int64) error {
+func UpdateInvoiceShipped(ctx context.Context, q Querier, id string, status string, shippedAt int64) error {
 	query := `
 		UPDATE invoices 
 		SET status = $1, shipped_at = $2, issuer_confirmed = TRUE
 		WHERE id = $3
 	`
-	_, err := Pool.Exec(ctx, query, status, shippedAt, id)
+	_, err := q.Exec(ctx, query, status, shippedAt, id)
 	if err != nil {
 		return fmt.Errorf("queries: update invoice shipped: %w", err)
 	}
 	return nil
 }
 
-func UpdateInvoiceDeliveryConfirmed(ctx context.Context, id string, status string, buyerConfirmedAt int64) error {
+func UpdateInvoiceDeliveryConfirmed(ctx context.Context, q Querier, id string, status string, buyerConfirmedAt int64) error {
 	query := `
 		UPDATE invoices 
 		SET status = $1, buyer_confirmed = TRUE, buyer_confirmed_at = $2
 		WHERE id = $3
 	`
-	_, err := Pool.Exec(ctx, query, status, buyerConfirmedAt, id)
+	_, err := q.Exec(ctx, query, status, buyerConfirmedAt, id)
 	if err != nil {
 		return fmt.Errorf("queries: update invoice delivery confirmed: %w", err)
 	}
 	return nil
 }
 
-func UpdateInvoiceRepaid(ctx context.Context, id string, status string, repaidAt int64) error {
+func UpdateInvoiceRepaid(ctx context.Context, q Querier, id string, status string, repaidAt int64) error {
 	query := `
 		UPDATE invoices 
 		SET status = $1, repaid_at = $2
 		WHERE id = $3
 	`
-	_, err := Pool.Exec(ctx, query, status, repaidAt, id)
+	_, err := q.Exec(ctx, query, status, repaidAt, id)
 	if err != nil {
 		return fmt.Errorf("queries: update invoice repaid: %w", err)
 	}
 	return nil
 }
 
-func UpdateInvoiceStatus(ctx context.Context, id string, status string) error {
+func UpdateInvoiceStatus(ctx context.Context, q Querier, id string, status string) error {
 	query := `
 		UPDATE invoices 
 		SET status = $1
 		WHERE id = $2
 	`
-	_, err := Pool.Exec(ctx, query, status, id)
+	_, err := q.Exec(ctx, query, status, id)
 	if err != nil {
 		return fmt.Errorf("queries: update invoice status: %w", err)
+	}
+	return nil
+}
+
+func UpdateInvoiceAttestation(ctx context.Context, q Querier, invoiceID, agentID, evidenceHash string, riskScoreBps int, attestedAt int64) error {
+	query := `
+		UPDATE invoices 
+		SET attestation_agent_id = $1, risk_score_bps = $2, evidence_hash = $3, attested_at = $4
+		WHERE id = $5
+	`
+	_, err := q.Exec(ctx, query, agentID, riskScoreBps, evidenceHash, attestedAt, invoiceID)
+	if err != nil {
+		return fmt.Errorf("queries: update invoice attestation: %w", err)
 	}
 	return nil
 }
@@ -322,7 +366,7 @@ func UpdatePoolStats(ctx context.Context, stats *DbPoolStats) error {
 	return nil
 }
 
-func LogEvent(ctx context.Context, eventID, contractID string, ledger int32, ledgerClosedAt int64, eventType string, data interface{}) error {
+func LogEvent(ctx context.Context, q Querier, eventID, contractID string, ledger int32, ledgerClosedAt int64, eventType string, data interface{}) error {
 	dataBytes, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("queries: log event: marshal data: %w", err)
@@ -333,7 +377,7 @@ func LogEvent(ctx context.Context, eventID, contractID string, ledger int32, led
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (event_id) DO NOTHING
 	`
-	_, err = Pool.Exec(ctx, query, eventID, contractID, ledger, ledgerClosedAt, eventType, dataBytes)
+	_, err = q.Exec(ctx, query, eventID, contractID, ledger, ledgerClosedAt, eventType, dataBytes)
 	if err != nil {
 		return fmt.Errorf("queries: log event: %w", err)
 	}
